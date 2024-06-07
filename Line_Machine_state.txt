@@ -1,0 +1,191 @@
+import rclpy, time
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from geometry_msgs.msg import Twist
+from cv_bridge import CvBridge
+import cv2
+import numpy as np
+from yolo_msgs.msg import Yolov8Inference
+
+class ColorAndCircleDetection(Node):
+    def __init__(self):
+        super().__init__('color_and_circle_detection')
+        self.get_logger().info("Puzzle catching lights.....")
+        self.bridge = CvBridge()
+        self.cv_image = None
+        self.state = "start"
+        self.vel = 0.0
+        #Declaraciones de subsripción y de publicador de imagen y velocidad del puzzlebot
+        self.sub = self.create_subscription(Image, '/video_source/raw', self.camera_callback, 20)
+        self.sub_inference = self.create_subscription(Yolov8Inference, "/yolov8_inference", self.traffic_signs_callback, 10)
+        self.pub = self.create_publisher(Twist, "/cmd_vel", 1)
+        self.state = "start" 
+        #Declaraciones de las banderas de las señales de transito
+        self.ahead = [0,0]
+        self.left = [0,0]
+        self.right = [0,0]
+        self.stop = [0,0]
+        #Declaración de la bandera del estado del semaforo
+        self.semaforo_green = [0,0]
+        self.semaforo_yellow = [0,0]
+        self.semaforo_red = [0,0]
+        self.class_name = None
+        self.msg = Twist()
+        #self.publish_vel = self.create_publisher(Int)
+        self.timer = self.create_timer(0.05, self.operations_callback)
+        
+    def camera_callback(self, msg):
+        #Recibimos la imagen capturada por el lente del puzzle y la convertimos para opencv
+        self.cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+
+    def traffic_signs_callback(self, msg):
+        
+        for element in msg.yolov8_inference:
+            
+            if element.class_name == "ahead_only":
+                self.ahead[0] = 1
+                area = (element.bottom - element.top)*(element.right - element.left)
+                if area > 2010:
+                    self.ahead[1] = 1
+                else:
+                    self.ahead[1] = 0
+            if element.class_name == "turn_right_ahead":
+                self.right = 1
+                area = (element.bottom - element.top)*(element.right - element.left)
+                if area > 240:
+                    self.right[1] = 1
+                else:
+                    self.right[1] = 0
+            if element.class_name == "turn_left_ahead":
+                self.left = 1
+                area = (element.bottom - element.top)*(element.right - element.left)
+                if area > 2650:
+                    self.left[1] = 1
+                else:
+                    self.left[1] = 0
+            if element.class_name == "stop":
+                self.stop = 1
+                area = (element.bottom - element.top)*(element.right - element.left)
+                if area > 2650:
+                    self.left[1] = 1
+                else:
+                    self.left[1] = 0
+            if element.class_name == "red":
+                self.semaforo_red = 1
+            if element.class_name == "green":
+                self.semaforo_green[0] = 1
+                area = (element.bottom - element.top)*(element.right - element.left)
+                if area > 660:
+                    self.semaforo_green[1] = 1
+                else:
+                    self.semaforo_green[1] = 0
+
+    def idle(self):
+        self.state = "follow_line"
+    
+    def linefollower(self):
+        
+        height, width = self.cv_image.shape[:2]
+
+        # Define the region of interest (lower fourth of the frame)
+        lower_fourth = self.cv_image[height * 3 // 4:height, 0:width]
+        roi_height, roi_width = lower_fourth.shape[:2]
+
+        roi = lower_fourth[0:roi_height // 2, 0:roi_width]       
+
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+        lower_black = np.array([0,0,0])   # Rango mínimo de color amarillo
+        upper_black = np.array([179,147,90]) #Rango máximo de color amaraillo
+
+        black_mask = cv2.inRange(hsv, lower_black, upper_black)
+        black_mask = cv2.GaussianBlur(black_mask, (7,7), 180)
+        
+        kernel = np.ones((5,5), np.uint8)
+        black_mask = cv2.morphologyEx(black_mask, cv2.MORPH_CLOSE, kernel)
+        black_mask = cv2.morphologyEx(black_mask, cv2.MORPH_OPEN, kernel)
+        
+        # Encontrar contornos en la imagen
+        contours, _ = cv2.findContours(black_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        if len(contours) > 0:
+            c = max(contours,key=cv2.contourArea)
+            M = cv2.moments(c)
+            if M["m00"] != 0:
+                cx = int(M["m10"]/M["m00"])
+                cy = int(M["m01"]/M["m00"])
+                error_x = cx-120
+                self.get_logger().info(str(error_x))
+                
+                if (error_x > -20 and error_x < 20):
+                    self.msg.linear.x = 0.015
+                    self.msg.angular.z = 0.0
+                    self.pub.publish(self.msg)
+
+                cv2.circle(roi,(cx,cy), 5, (0,255,255), -1)
+                # Dibujar contornos en la imagen original
+        else:
+            self.state = "stop"
+
+        cv2.drawContours(roi, contours, -1, (0, 255, 0), 2)
+    # Mostrar la imagen con los contornos
+        cv2.imshow('Contours', roi)
+        cv2.waitKey(1)
+    
+    #Estado donde nos detenemos al no detectar linea y así pasar al estado de semaforo
+    def stop_state(self):
+        self.msg.linear.x = 0.0
+        self.msg.angular.z = 0.0
+        self.pub.publish(self.msg)
+        self.state = "semaforo"
+
+    #Estado donde hacemos la lectura del semaforo para así poder al estado de sign
+    def semaforo(self):
+        if self.semaforo_green[1] == 1:
+            self.state = "sign"
+        else:
+            self.msg.linear.x = 0.0
+            self.msg.angular.z = 0.0
+            self.pub.publish(self.msg)
+
+    #Estado donde hacemos la lectura de la señal para ejecutar trayectoria
+    def sign(self):
+        if self.ahead[1] == 1:
+            self.msg.linear.x = 0.05
+            self.msg.angular.z = 0.0
+            self.pub.publish(self.msg)
+        if self.left[1] == 1:
+            self.msg.linear.x = 0.02
+            self.msg.angular.z = 0.0
+            self.pub.publish(self.msg)
+            time.sleep(1.2)
+            self.msg.linear.x = 0.035   
+            self.msg.angular.z = 0.1
+            self.pub.publish(self.msg)
+
+    def operations_callback(self):
+        if self.cv_image is not None:
+            if self.state == "start":
+                self.idle()
+                print("sali de start")
+            elif self.state == "follow_line":
+                self.linefollower()
+                print("sali de line")
+            elif self.state == "stop":
+                self.stop_state()
+                print("sali de stop")
+            elif self.state == "semaforo":
+                self.semaforo()
+                print("Saliendo de semaforo")
+            elif self.state == "sign":
+                self.sign()
+                print("EStoy saliendo de sign")
+                    
+def main(args=None):
+    rclpy.init(args=args)
+    nodeh = ColorAndCircleDetection()
+    try: rclpy.spin(nodeh)
+    except Exception as error: print(error)
+    except KeyboardInterrupt: print("Node interrupted")
+
+if __name__ == '__main__':
+    main()
