@@ -1,0 +1,101 @@
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from geometry_msgs.msg import Twist
+from std_msgs.msg import Int32
+from cv_bridge import CvBridge
+import cv2
+import numpy as np
+
+# Parámetros definidos por el usuario
+MIN_AREA = 400  # Área mínima para considerar un contorno
+MIN_AREA_TRACK = 420  # Área mínima para considerar una pista válida
+ASPECT_RATIO_THRESHOLD = 0.5  # Relación de aspecto mínima
+CONTOUR_LENGTH_THRESHOLD = 50  # Longitud mínima del contorno
+
+class ColorAndCircleDetection(Node):
+    def __init__(self):
+        super().__init__('line_error_detection')
+        self.get_logger().info("Puzzle catching lights.....")
+        self.bridge = CvBridge()
+        self.cv_image = None
+        self.sub = self.create_subscription(Image, '/video_source/raw', self.camera_callback, 20)
+        self.pub_error = self.create_publisher(Int32, "/error_center", 10)
+        self.pub_center = self.create_publisher(Int32, "/no_center", 10)
+        self.timer = self.create_timer(0.1, self.operations_callback)
+        self.width = 320
+        self.height = 180
+        self.lateral_search = 20
+        self.start_height = self.height - 5
+        self.center_correction = 38
+        
+    def camera_callback(self, msg):
+        self.cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+        
+    def operations_callback(self):
+        if self.cv_image is not None:
+            msg = Int32()
+            msg_error = Int32()
+            height, width = self.cv_image.shape[:2]
+            lower_fourth = self.cv_image[height * 3 // 4:height, 0:width]
+            roi_height, roi_width = lower_fourth.shape[:2]
+            margin = 30
+            margin = min(margin, roi_width // 2)
+            roi = lower_fourth[0:roi_height // 2, margin:roi_width - margin]
+
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            black_mask = cv2.adaptiveThreshold(
+                gray,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY_INV,
+                199,
+                10)
+
+            contours, _ = cv2.findContours(black_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+            valid_contours = []
+            
+            for c in contours:
+                area = cv2.contourArea(c)
+                if area > MIN_AREA_TRACK:
+                    x, y, w, h = cv2.boundingRect(c)
+                    aspect_ratio = float(w) / h
+                    contour_length = cv2.arcLength(c, True)
+                    if aspect_ratio > ASPECT_RATIO_THRESHOLD and contour_length > CONTOUR_LENGTH_THRESHOLD:
+                        valid_contours.append(c)
+            
+            if len(valid_contours) > 0:
+                msg_error.data = 1
+                self.pub_center.publish(msg_error)
+                c = max(valid_contours, key=cv2.contourArea)
+                M = cv2.moments(c)
+                if M["m00"] != 0:
+                    print("ando encontrando linea")
+                    cx = int(M["m10"]/M["m00"])
+                    cy = int(M["m01"]/M["m00"])
+                    error_x = cx - (roi_width // 2) + self.center_correction
+                    self.get_logger().info(str(error_x))
+                    msg.data = error_x
+                    self.pub_error.publish(msg)
+
+                    #cv2.circle(roi, (cx, cy), 5, (0, 255, 255), -1)
+            else:
+                print("NO ENCONTRE LINEA")
+                msg_error.data = 0
+                self.pub_center.publish(msg_error)
+
+            #cv2.imshow('Contours', roi)
+            #cv2.waitKey(1)
+                    
+def main(args=None):
+    rclpy.init(args=args)
+    nodeh = ColorAndCircleDetection()
+    try:
+        rclpy.spin(nodeh)
+    except Exception as error:
+        print(error)
+    except KeyboardInterrupt:
+        print("Node interrupted")
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,279 @@
+import rclpy
+import time
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from geometry_msgs.msg import Twist
+from cv_bridge import CvBridge
+import cv2
+from yolo_msgs.msg import Yolov8Inference
+from std_msgs.msg import Int32
+
+class ColorAndCircleDetection(Node):
+    def __init__(self):
+        super().__init__('color_and_circle_detection')
+        self.get_logger().info("Puzzle catching lights.....")
+        self.bridge = CvBridge()
+        self.cv_image = None
+        self.state = "start"
+        # Declaraciones de suscripción y publicador de imagen y velocidad del puzzlebot
+        self.sub = self.create_subscription(Image, '/video_source/raw', self.camera_callback, 20)
+        self.sub_inference = self.create_subscription(Yolov8Inference, "/yolov8_inference", self.traffic_signs_callback, 20)
+        self.pub_error = self.create_subscription(Int32, "/error_center", self.center, 20)
+        self.pub_center = self.create_subscription(Int32, "/no_center", self.no_center, 20)
+        self.pub = self.create_publisher(Twist, "/cmd_vel", 20)
+        self.state = "start" 
+        # Declaraciones de las banderas de las señales de tránsito
+        self.ahead = [0,0]
+        self.left = [0,0,0]
+        self.right = [0,0]
+        self.stop = [0,0]
+        self.ahead_time = 0
+        # Declaración de la bandera del estado del semáforo
+        self.semaforo_green = [0,0,0,0]
+        self.class_name = None
+        self.center_line = None
+        self.nCenter = None
+        self.sema = 2
+        
+        self.timer = self.create_timer(0.1, self.operations_callback)
+
+    def center(self, msg):
+        self.center_line = msg.data
+    
+    def no_center(self, msg):
+        self.nCenter = msg.data
+
+    def camera_callback(self, msg):
+        # Recibimos la imagen capturada por el lente del puzzle y la convertimos para OpenCV
+        self.cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+
+    def traffic_signs_callback(self, msg):
+        for element in msg.yolov8_inference: 
+            if element.class_name != "green" or element.class_name != "red" or element.class_name != "yellow":
+                self.sema = 0
+            else:
+                self.sema = 1
+        
+            if element.class_name == "ahead_only":
+                self.ahead[0] = 1
+                area = (element.bottom - element.top)*(element.right - element.left)
+                if area > 950:
+                    self.ahead[1] = 1
+            if element.class_name == "turn_right_ahead":
+                self.right[0] = 1
+                area = (element.bottom - element.top)*(element.right - element.left)
+                #if 830 < area > 1150:
+                if area < 1470:
+                    print("area confirmada")
+                    self.right[1] = 1
+                else:
+                    self.right[1] = 0
+            if element.class_name == "turn_left_ahead":
+                self.left[0] = 1
+                
+                area = (element.bottom - element.top)*(element.right - element.left)
+                if area > 1290:
+                    self.left[1] = 1
+                    self.left[2] = 1
+                else:
+                    self.left[1] = 0
+            if element.class_name == "stop":
+                self.stop[0] = 1
+                area = (element.bottom - element.top)*(element.right - element.left)
+                if area > 1300:
+                    self.stop[1] = 1
+                else:
+                    self.stop[1] = 0
+            if element.class_name == "red":
+                self.semaforo_green[0] = 0
+                self.semaforo_green[1] = 0
+                self.semaforo_green[2] = 1
+                self.semaforo_green[3] = 0
+                
+            if element.class_name == "green":
+                self.semaforo_green[0] = 1
+                self.semaforo_green[1] = 0
+                self.semaforo_green[2] = 0
+                area = (element.bottom - element.top)*(element.right - element.left)
+                if area > 530:
+                    print("verde afirma")
+                    self.semaforo_green[3] = 1
+                else:
+                    self.semaforo_green[3] = 0
+
+    def idle(self):
+        self.state = "follow_line"
+    
+    def linefollower(self):
+        if self.center_line is not None:
+            if self.stop[1] == 0:
+                msg = Twist()
+                if (self.center_line > -18 and self.center_line < 18) and self.nCenter == 1:
+                    msg.linear.x = 0.09
+                    msg.angular.z = 0.0
+                    self.pub.publish(msg)
+                elif self.center_line < -18 and self.nCenter == 1:
+                    msg.linear.x = 0.07
+                    msg.angular.z = -self.center_line * 0.0075
+                    self.pub.publish(msg)
+                elif self.center_line > 18 and self.nCenter == 1:
+                    msg.linear.x = 0.07
+                    msg.angular.z = -self.center_line * 0.0075
+                    self.pub.publish(msg)
+                elif self.nCenter == 0:
+                    self.state = "stop"
+            else:
+                self.state = "stop_start"
+
+    def stop_start(self):
+        start_time = time.time()
+        tiempo = time.time()-start_time
+        msg = Twist()
+        while tiempo < 2.5:
+            tiempo = time.time()-start_time
+        msg.linear.x = 0.0
+        msg.angular.z = 0.0
+        self.pub.publish(msg)
+        
+    def stop_state(self):
+        if self.nCenter == 1:
+            self.state = "follow_line"
+        else:
+            msg = Twist()
+            msg.linear.x = 0.0
+            msg.angular.z = 0.0
+            self.pub.publish(msg)
+            self.state = "semaforo"
+
+    def semaforo(self):
+        if (self.semaforo_green[3] == 1 and self.semaforo_green[0] == 1) or self.sema == 0:
+            self.state = "sign" 
+        else:
+            self.state = "stop"
+
+    def sign(self):
+        if self.nCenter == 1:
+          self.state = "follow_line"
+        elif self.nCenter == 0:
+          if self.ahead[1] == 1:
+              self.state = "ahead"
+            
+          if self.right[1] == 1:
+              self.state = "right"
+
+          if self.left[1] == 1:
+              self.state = "left_turn"
+            
+          if self.left[1] == 0 and self.right[1] == 0 and self.ahead[1] == 0:
+              self.state = "follow_line"
+            
+    def go_ahead(self):
+        start_time = time.time()
+        tiempo = time.time()-start_time
+        msg = Twist()
+        self.t0 = time.time()
+        
+        msg.linear.x = 0.075
+        msg.angular.z = 0.0
+        self.pub.publish(msg)
+        while tiempo < 6.5:
+            tiempo = time.time()-start_time
+        msg.linear.x = 0.0
+        msg.angular.z = 0.0
+        self.pub.publish(msg)
+        
+        self.nCenter = 1
+        self.ahead[1] = 0
+        self.left[1] = 0
+        self.right[1] = 0
+        self.state = "follow_line"
+
+    def right_turn(self):
+        start_time = time.time()
+        msg = Twist()
+    
+        msg.linear.x = 0.04
+        msg.angular.z = 0.0
+        self.pub.publish(msg)
+        while time.time() - start_time < 3:
+            pass
+        start_time = time.time()
+    
+        msg.linear.x = 0.03
+        msg.angular.z = -0.14
+        self.pub.publish(msg)
+        while time.time() - start_time < 8:
+            pass
+        self.ahead[1] = 0
+        self.right[1] = 0
+        self.left[1] = 0
+        msg.linear.x = 0.0
+        msg.angular.z = 0.0
+        self.pub.publish(msg)
+        self.nCenter = 1
+        #time.sleep(1)
+        self.state = "follow_line"
+    
+    def turn_left(self):
+        start_time = time.time()
+        msg = Twist()
+        msg.linear.x = 0.04
+        msg.angular.z = 0.0
+        self.pub.publish(msg)
+        while time.time() - start_time < 3:
+            pass
+        start_time = time.time()
+        msg.linear.x = 0.03  
+        msg.angular.z = 0.14
+        self.pub.publish(msg)
+        while time.time() - start_time < 8:
+            pass
+        self.left[1] = 0
+        self.right[1] = 0
+        self.ahead[1] = 0
+        msg.linear.x = 0.0
+        msg.angular.z = 0.0
+        self.pub.publish(msg)
+        self.nCenter = 1
+        #time.sleep(1)
+        self.state = "follow_line"
+
+    def operations_callback(self):
+        if self.cv_image is not None:
+            if self.state == "start":
+                self.idle()
+            elif self.state == "follow_line":
+                print("line")
+                self.linefollower()
+            elif self.state == "stop_start":
+                print("stop")
+                self.stop_start()
+            elif self.state == "stop":
+                print("stoping")
+                self.stop_state()
+            elif self.state == "semaforo":
+                print("semaforo")
+                self.semaforo()
+            elif self.state == "sign":
+                print("señal")
+                self.sign()
+            elif self.state == "ahead":
+                self.ahead_time = time.time()
+                self.go_ahead()
+            elif self.state == "right":
+                self.right_turn()
+            elif self.state == "left_turn":
+                self.turn_left()
+                    
+def main(args=None):
+    rclpy.init(args=args)
+    nodeh = ColorAndCircleDetection()
+    try:
+        rclpy.spin(nodeh)
+    except Exception as error:
+        print(error)
+    except KeyboardInterrupt:
+        print("Node interrupted")
+
+if __name__ == '__main__':
+    main()
